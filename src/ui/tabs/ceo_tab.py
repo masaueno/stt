@@ -1,11 +1,12 @@
-"""社長音声タブ。
+"""社長音声 / 業務記録タブ(共用)。
 
-Web版では、ブラウザのマイク録音を社長音声として `ceo_transcriptions` に保存する。
+カテゴリ(ui.categories.CEO / WORK)を引数に取り、マイク録音とファイル読み込みを
+`ceo_transcriptions` に保存する。カテゴリの違いは tags・話者の既定値・
+session_state のキーだけで、画面構成は同一。
 """
 
 from __future__ import annotations
 
-import html
 import tempfile
 from datetime import datetime
 from hashlib import sha256
@@ -16,57 +17,44 @@ import streamlit as st
 
 from services.ceo_processor import (
     DEFAULT_CEO_MODEL,
-    DEFAULT_CEO_SPEAKER,
-    CeoBatchSummary,
     CeoProcessResult,
     process_ceo_uploaded_path,
 )
+from services.ceo_time_utils import recorded_at_to_jst
+from ui.categories import Category
+from ui.components import (
+    QueueItem,
+    cleanup_paths,
+    render_file_input,
+    render_import_info,
+    render_mic_input,
+    render_queue,
+    result_card,
+    should_process_recording,
+)
+
+_START_LABEL = "取り込み開始"
+DEFAULT_VAD_ENABLED = True
+DEFAULT_VAD_AGGRESSIVENESS = 2
 
 
-DEFAULT_CEO_VAD_ENABLED = True
-DEFAULT_CEO_VAD_AGGRESSIVENESS = 2
+# ---------- state ----------
 
-
-# ---------- state helpers ----------
-
-def _ensure_state() -> dict:
+def _state(category: Category) -> dict:
     return st.session_state.setdefault(
-        "ceo_tab_state",
-        {
-            "last_summary": None,   # CeoBatchSummary | None
-            "active_idx": 0,        # 「処理結果」で表示する結果のインデックス
-        },
+        f"ceo_tab_state_{category.key}",
+        {"results": [], "active_idx": 0},  # results: CeoProcessResult(全件) / active_idx: 処理結果で表示する結果
     )
 
 
-def _format_duration(value) -> str:
-    if value is None:
-        return "-"
-    try:
-        return f"{float(value):.1f} 秒"
-    except Exception:
-        return str(value)
-
-
-def _format_datetime(value: Optional[str]) -> str:
-    if not value:
-        return "-"
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return value
-
-
-def _html_text(value) -> str:
-    return html.escape(str(value or ""), quote=True)
-
-
-def _ceo_vad_settings() -> tuple[bool, int]:
+def _vad_settings() -> tuple[bool, int]:
     app_settings = st.session_state.get("settings")
-    use_vad = bool(getattr(app_settings, "get_use_vad", lambda: DEFAULT_CEO_VAD_ENABLED)())
-    vad_aggr = int(getattr(app_settings, "get_vad_aggressiveness", lambda: DEFAULT_CEO_VAD_AGGRESSIVENESS)())
+    use_vad = bool(getattr(app_settings, "get_use_vad", lambda: DEFAULT_VAD_ENABLED)())
+    vad_aggr = int(getattr(app_settings, "get_vad_aggressiveness", lambda: DEFAULT_VAD_AGGRESSIVENESS)())
     return use_vad, vad_aggr
 
+
+# ---------- 一時ファイル ----------
 
 def _suffix_from_audio_upload(uf, default: str = ".wav") -> str:
     name_suffix = Path(getattr(uf, "name", "") or "").suffix
@@ -87,9 +75,9 @@ def _suffix_from_audio_upload(uf, default: str = ".wav") -> str:
 def _persist_uploaded_file(
     uf,
     *,
-    source_kind: str = "mic",
+    source_kind: str,
     file_name_override: Optional[str] = None,
-    temp_prefix: str = "stt_ceo_mic_",
+    temp_prefix: str = "stt_ceo_",
 ) -> dict:
     temp_dir = Path(tempfile.mkdtemp(prefix=temp_prefix))
     file_name = Path(file_name_override or getattr(uf, "name", "") or "uploaded_audio").name
@@ -111,84 +99,68 @@ def _persist_uploaded_file(
 
     return {
         "source_kind": source_kind,
-        "file_path": None,
         "temp_file_path": str(temp_path),
         "temp_dir": str(temp_dir),
         "file_name": file_name,
         "size_bytes": size,
         "modified_at": None,
+        "recorded_at": None,
         "source_file_hash": digest.hexdigest(),
     }
 
 
-def _persist_mic_recording(audio_value) -> dict:
+def _persist_mic_recording(audio_value, category: Category) -> dict:
     timestamp = datetime.now()
     suffix = _suffix_from_audio_upload(audio_value)
-    file_name = f"ceo_mic_{timestamp.strftime('%Y%m%d_%H%M%S')}{suffix}"
+    file_name = f"{category.file_prefix}_{timestamp.strftime('%Y%m%d_%H%M%S')}{suffix}"
     entry = _persist_uploaded_file(
         audio_value,
         source_kind="mic",
         file_name_override=file_name,
-        temp_prefix="stt_ceo_mic_",
+        temp_prefix=f"stt_{category.key}_mic_",
     )
     entry["modified_at"] = timestamp.isoformat(timespec="seconds")
     entry["recorded_at"] = timestamp.isoformat(timespec="seconds")
     return entry
 
 
-def _cleanup_temp_uploads(files) -> None:
-    for f in files or []:
-        temp_path = f.get("temp_file_path")
-        if temp_path:
-            try:
-                Path(temp_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-        temp_dir = f.get("temp_dir")
-        if temp_dir:
-            try:
-                Path(temp_dir).rmdir()
-            except Exception:
-                pass
+# ---------- 処理 ----------
 
-
-def _process_ceo_entries(
+def _process_entries(
     files: list[dict],
     *,
+    category: Category,
     title_override: str,
     speaker: str,
     recorded_at_override: Optional[str],
     selected_model: str,
     logger,
-) -> CeoBatchSummary:
-    summary = CeoBatchSummary()
+) -> list[CeoProcessResult]:
+    results: list[CeoProcessResult] = []
+    total = len(files)
+    if total == 0:
+        return results
     progress = st.progress(0.0)
     status = st.empty()
-    total = len(files)
-    use_vad, vad_aggressiveness = _ceo_vad_settings()
-
-    if total == 0:
-        return summary
+    use_vad, vad_aggressiveness = _vad_settings()
 
     for idx, f in enumerate(files):
         status.text(f"処理中: {f['file_name']} ({idx + 1}/{total})")
-        per_title = title_override or Path(f["file_name"]).stem
         effective_recorded_at = (
             recorded_at_override
             or f.get("recorded_at")
             or f.get("modified_at")
             or datetime.now().isoformat(timespec="seconds")
         )
-
         logger.info(
-            "CEO 処理開始 (%s): name=%s size=%s hash=%s",
-            f["source_kind"], f["file_name"], f["size_bytes"], f.get("source_file_hash"),
+            "%s 処理開始 (%s): name=%s size=%s hash=%s",
+            category.label, f["source_kind"], f["file_name"], f["size_bytes"], f.get("source_file_hash"),
         )
         result = process_ceo_uploaded_path(
             file_name=f["file_name"],
             temp_file_path=f["temp_file_path"],
-            title=per_title,
-            speaker=speaker,
+            title=title_override or Path(f["file_name"]).stem,
+            speaker=speaker or category.default_speaker,
             recorded_at=effective_recorded_at,
             source_file_size_bytes=f["size_bytes"],
             source_file_modified_at=f.get("modified_at"),
@@ -197,151 +169,172 @@ def _process_ceo_entries(
             use_vad=use_vad,
             vad_aggressiveness=vad_aggressiveness,
             cleanup_source=True,
+            tags=category.tag,
+            input_method="mic" if f["source_kind"] == "mic" else "file_import",
         )
-        summary.results.append(result)
+        results.append(result)
         progress.progress((idx + 1) / total)
 
-    status.text(
-        f"完了: 成功 {summary.ok_count} / 重複スキップ {summary.skipped_count} / 失敗 {summary.error_count}"
-    )
-    return summary
+    ok = sum(1 for r in results if r.status == "ok")
+    skipped = sum(1 for r in results if r.status == "skipped_duplicate")
+    err = sum(1 for r in results if r.status == "error")
+    status.text(f"完了: 成功 {ok} / 重複スキップ {skipped} / 失敗 {err}")
+    return results
 
 
-# ---------- queue (マイク録音 / 処理履歴) ----------
-
-_STATUS_BADGE = {
-    "ok": ("完了", "#16a34a"),
-    "skipped_duplicate": ("重複", "#6b7280"),
-    "error": ("失敗", "#dc2626"),
-}
-
-
-def _source_label(source_kind: str) -> str:
-    if source_kind == "mic":
-        return "マイク録音"
-    return "社長音声"
-
-
-def _render_queue(summary: Optional[CeoBatchSummary]) -> None:
-    """desktop の RecorderUploadQueue 相当。Streamlit は同期実行のため
-    「処理中 / 待機」は常に 0 として表示し、完了後の集計のみ反映する。
-    """
-
-    done = err = 0
-    rows: list[tuple[str, str, str, str]] = []  # (status_label, source_label, file_name, memo)
-    if summary and summary.results:
-        for r in summary.results:
-            label, _ = _STATUS_BADGE.get(r.status, ("-", "#6b7280"))
-            source = _source_label(r.source_kind)
-            memo = ""
-            if r.status == "error":
-                memo = r.error or "処理に失敗しました"
-            elif r.status == "skipped_duplicate":
-                memo = f"既存ID: {r.matched_existing_id}" if r.matched_existing_id else "重複"
-            elif r.status == "ok":
-                memo = "完了"
-            rows.append((label, source, r.file_name, memo))
-        done = sum(1 for r in summary.results if r.status == "ok")
-        err = sum(1 for r in summary.results if r.status == "error")
-
-    with st.container(border=True):
-        c1, c2 = st.columns([3, 4])
-        with c1:
-            st.markdown("### マイク録音 / 処理履歴")
-        with c2:
-            st.markdown(
-                f"<div style='text-align:right;font-size:12px;color:#555;'>"
-                f"処理中: 0 ・ 待機: 0 ・ 完了: {done} ・ 失敗: {err}"
-                f"</div>",
-                unsafe_allow_html=True,
+def _run_batch(
+    files: list[dict],
+    *,
+    category: Category,
+    import_info: tuple[str, str, str],
+    selected_model: str,
+    logger,
+) -> None:
+    state = _state(category)
+    title, speaker, recorded_at = import_info
+    try:
+        with st.spinner(f"{category.label}として文字起こし中..."):
+            results = _process_entries(
+                files,
+                category=category,
+                title_override=title,
+                speaker=speaker,
+                recorded_at_override=recorded_at or None,
+                selected_model=selected_model or DEFAULT_CEO_MODEL,
+                logger=logger,
             )
-        st.caption("録音ごとに1件ずつ処理します。")
-        if not rows:
-            st.caption("まだ処理した録音はありません。")
-            return
-        # シンプルなテーブル風表示
-        st.markdown(
-            "<table style='width:100%;border-collapse:collapse;font-size:12px;'>"
-            "<thead><tr style='background:#f4f6f8;'>"
-            "<th style='text-align:left;padding:6px 8px;width:80px;'>状態</th>"
-            "<th style='text-align:left;padding:6px 8px;width:100px;'>種別</th>"
-            "<th style='text-align:left;padding:6px 8px;'>ファイル名</th>"
-            "<th style='text-align:left;padding:6px 8px;'>メモ</th>"
-            "</tr></thead><tbody>"
-            + "".join(
-                (
-                    f"<tr style='border-bottom:1px solid #f0f2f5;'>"
-                    f"<td style='padding:6px 8px;color:{_STATUS_BADGE.get(_status_key_from_label(label), ('','#555'))[1]};'>● {_html_text(label)}</td>"
-                    f"<td style='padding:6px 8px;'>{_html_text(source)}</td>"
-                    f"<td style='padding:6px 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:320px;' title='{_html_text(name)}'>{_html_text(name)}</td>"
-                    f"<td style='padding:6px 8px;color:#555;'>{_html_text(memo)}</td>"
-                    f"</tr>"
-                )
-                for (label, source, name, memo) in rows
-            )
-            + "</tbody></table>",
-            unsafe_allow_html=True,
+        state["results"].extend(results)
+        state["active_idx"] = max(0, len(state["results"]) - 1)
+        ok = sum(1 for r in results if r.status == "ok")
+        skipped = sum(1 for r in results if r.status == "skipped_duplicate")
+        err = sum(1 for r in results if r.status == "error")
+        if ok:
+            st.success(f"{category.label}として保存しました。")
+        if skipped:
+            st.info("既に保存済みの音声は重複としてスキップしました。")
+        if err:
+            st.error("取り込みに失敗した音声があります。処理結果を確認してください。")
+    except Exception as exc:
+        st.error(f"{category.label}の取り込みに失敗しました: {exc}")
+        logger.exception("%s processing failed", category.key)
+    finally:
+        cleanup_paths([f.get("temp_file_path") for f in files])
+        cleanup_paths([f.get("temp_dir") for f in files])
+
+
+def _handle_mic(category: Category, import_info, selected_model: str, logger) -> None:
+    prefix = f"{category.key}"
+    audio_value = render_mic_input(f"{prefix}_mic_audio", sample_rate=16000)
+    if not audio_value:
+        return
+    go, digest = should_process_recording(audio_value, prefix)
+    if not go:
+        return
+
+    st.session_state[f"{prefix}_mic_processing"] = True
+    files: list[dict] = []
+    try:
+        files = [_persist_mic_recording(audio_value, category)]
+        first = files[0]
+        logger.info(
+            "%s 録音受領: name=%s size=%s type=%s hash=%s",
+            category.label, first["file_name"], first["size_bytes"],
+            getattr(audio_value, "type", ""), first["source_file_hash"],
         )
+        _run_batch(files, category=category, import_info=import_info, selected_model=selected_model, logger=logger)
+    except Exception as exc:
+        st.error(f"録音データの保存に失敗しました: {exc}")
+        logger.exception("%s mic recording failed", category.key)
+        cleanup_paths([f.get("temp_file_path") for f in files])
+        cleanup_paths([f.get("temp_dir") for f in files])
+    finally:
+        st.session_state[f"{prefix}_mic_last_digest"] = digest
+        st.session_state[f"{prefix}_mic_processing"] = False
 
 
-def _status_key_from_label(label: str) -> str:
-    for k, (status_label, _) in _STATUS_BADGE.items():
-        if status_label == label:
-            return k
-    return "ok"
+def _handle_files(category: Category, import_info, selected_model: str, logger) -> None:
+    uploads, clicked = render_file_input(category.key, _START_LABEL)
+    if not clicked or not uploads:
+        return
+    files: list[dict] = []
+    try:
+        files = [
+            _persist_uploaded_file(uf, source_kind="file", temp_prefix=f"stt_{category.key}_file_")
+            for uf in uploads
+        ]
+    except Exception as exc:
+        st.error(f"ファイルの読み込みに失敗しました: {exc}")
+        logger.exception("%s file import failed", category.key)
+        cleanup_paths([f.get("temp_file_path") for f in files])
+        cleanup_paths([f.get("temp_dir") for f in files])
+        return
+    _run_batch(files, category=category, import_info=import_info, selected_model=selected_model, logger=logger)
 
 
-# ---------- 処理結果（常時表示） ----------
+# ---------- 処理キュー / 処理結果 ----------
 
-def _render_result_panel(summary: Optional[CeoBatchSummary], active_idx: int) -> None:
+def _queue_items(results: list[CeoProcessResult]) -> list[QueueItem]:
+    items = []
+    for r in results:
+        if r.status == "error":
+            memo = r.error or "処理に失敗しました"
+        elif r.status == "skipped_duplicate":
+            memo = f"既存ID: {r.matched_existing_id}" if r.matched_existing_id else "重複"
+        else:
+            memo = "完了"
+        items.append(QueueItem(status=r.status, kind=r.source_kind, file_name=r.file_name, memo=memo))
+    return items
+
+
+def _format_duration(value) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.1f} 秒"
+    except Exception:
+        return str(value)
+
+
+def _format_recorded_at(value: Optional[str]) -> str:
+    dt = recorded_at_to_jst(value)
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else (value or "-")
+
+
+def _render_result_panel(category: Category) -> None:
+    state = _state(category)
+    results: list[CeoProcessResult] = state["results"]
     active: Optional[CeoProcessResult] = None
-    if summary and summary.results:
-        active_idx = max(0, min(active_idx, len(summary.results) - 1))
-        active = summary.results[active_idx]
+    active_idx = 0
+    if results:
+        active_idx = max(0, min(state.get("active_idx", 0), len(results) - 1))
+        active = results[active_idx]
 
-    # ステータスバッジ
-    if active is None:
-        badge_text, badge_bg, badge_fg = "待機中", "#eee", "#666"
-    elif active.status == "ok":
-        badge_text, badge_bg, badge_fg = "完了", "#e8f8ef", "#1a7f4b"
-    elif active.status == "skipped_duplicate":
-        badge_text, badge_bg, badge_fg = "重複スキップ", "#f3f4f6", "#374151"
-    else:
-        badge_text, badge_bg, badge_fg = "失敗", "#fdecea", "#b00020"
-
-    with st.container(border=True):
-        head_l, head_r = st.columns([3, 1])
-        with head_l:
-            st.markdown("### 処理結果")
-        with head_r:
-            st.markdown(
-                f"<div style='text-align:right;'><span style='font-size:12px;padding:2px 10px;border-radius:999px;background:{badge_bg};color:{badge_fg};'>{badge_text}</span></div>",
-                unsafe_allow_html=True,
-            )
-
-        # ジョブ切替（結果が複数あるとき）
-        if summary and len(summary.results) > 1:
-            options = list(range(len(summary.results)))
-            labels = [f"{i+1}. {r.file_name}" for i, r in enumerate(summary.results)]
+    with result_card(active.status if active else None):
+        if len(results) > 1:
             selected = st.selectbox(
                 "結果を選択",
-                options=options,
+                options=list(range(len(results))),
                 index=active_idx,
-                format_func=lambda i: labels[i],
-                key="ceo_active_result_select",
+                format_func=lambda i: f"{i + 1}. {results[i].file_name}",
+                key=f"{category.key}_active_result_select",
             )
             if selected != active_idx:
-                state = _ensure_state()
                 state["active_idx"] = selected
                 st.rerun()
 
-        # 詳細グリッド
         cols = st.columns(3)
         with cols[0]:
             st.markdown("**ファイル**")
             st.write(active.file_name if active else "-")
             st.markdown("**タイトル**")
             st.write(active.title if active and active.title else "-")
+            st.markdown("**話者**")
+            st.write(active.speaker if active and active.speaker else "-")
+        with cols[1]:
+            st.markdown("**録音日時**")
+            st.write(_format_recorded_at(active.recorded_at) if active else "-")
+            st.markdown("**長さ**")
+            st.write(_format_duration(active.duration_seconds) if active else "-")
             st.markdown("**DB保存**")
             if active is None:
                 st.write("-")
@@ -351,18 +344,9 @@ def _render_result_panel(summary: Optional[CeoBatchSummary], active_idx: int) ->
                 st.write(f"⏭️ 既存 (ID: {active.matched_existing_id or '-'})")
             else:
                 st.write("未保存")
-        with cols[1]:
-            st.markdown("**元音声**")
-            st.write(active.file_name if active else "-")
-            st.markdown("**話者**")
-            st.write(active.speaker if active and active.speaker else "-")
         with cols[2]:
             st.markdown("**VAD保存先**")
             st.write(active.saved_path if active and active.saved_path else "-")
-            st.markdown("**録音日時**")
-            st.write(_format_datetime(active.recorded_at) if active else "-")
-            st.markdown("**長さ**")
-            st.write(_format_duration(active.duration_seconds) if active else "-")
 
         if active and active.vad_note:
             st.caption(active.vad_note)
@@ -373,142 +357,25 @@ def _render_result_panel(summary: Optional[CeoBatchSummary], active_idx: int) ->
 
         st.markdown("**文字起こし**")
         st.text_area(
-            "文字起こし結果",
+            "文字起こし",
             value=(active.transcript or "") if active else "",
             height=180,
             placeholder="ここに結果が表示されます",
-            key=f"ceo_result_text_{active_idx if active else 'placeholder'}",
+            key=f"{category.key}_result_text_{active_idx if active else 'placeholder'}",
             label_visibility="collapsed",
         )
 
 
-def _audio_value_digest(audio_value) -> Optional[str]:
-    try:
-        raw = audio_value.getvalue() if hasattr(audio_value, "getvalue") else audio_value
-        return sha256(raw).hexdigest()
-    except Exception:
-        return None
+# ---------- main ----------
 
+def run_ceo_tab(category: Category, selected_model: str, logger) -> None:
+    st.header(category.label)
+    st.caption(category.description)
 
-def _render_mic_recorder(selected_model: str, logger) -> None:
-    state = _ensure_state()
+    import_info = render_import_info(category, category.key)
+    model = selected_model or DEFAULT_CEO_MODEL
+    _handle_mic(category, import_info, model, logger)
+    _handle_files(category, import_info, model, logger)
 
-    with st.container(border=True):
-        st.markdown("### マイクで録音して取り込み")
-        st.caption("ブラウザのマイクで録音した音声を、社長音声として ceo_transcriptions に保存します。")
-
-        col_title, col_speaker, col_time = st.columns([2, 1, 2])
-        with col_title:
-            title_input = st.text_input(
-                "タイトル（空欄なら録音ファイル名を使用）",
-                value="",
-                key="ceo_mic_title",
-            )
-        with col_speaker:
-            speaker_input = st.text_input(
-                "話者",
-                value=DEFAULT_CEO_SPEAKER,
-                key="ceo_mic_speaker",
-            )
-        with col_time:
-            recorded_at_input = st.text_input(
-                "録音日時（空欄なら録音完了時刻）",
-                value="",
-                key="ceo_mic_recorded_at",
-                help="ISO 8601形式で指定できます。例: 2026-05-21T10:00:00",
-            )
-
-        audio_value = st.audio_input(
-            "🎙️ 社長音声を録音してください",
-            sample_rate=16000,
-            help="録音を停止すると自動で文字起こしと保存を開始します。",
-            key="ceo_mic_audio_input",
-        )
-        if not audio_value:
-            return
-
-        st.success("録音完了。社長音声として取り込みます。")
-        current_digest = _audio_value_digest(audio_value)
-        if not current_digest:
-            st.error("録音データの確認に失敗しました。もう一度録音してください。")
-            return
-
-        disabled = bool(st.session_state.get("ceo_mic_processing", False))
-        if disabled:
-            st.info("社長音声を取り込み中です。")
-            return
-
-        already_processed = st.session_state.get("ceo_mic_last_digest") == current_digest
-        retry = False
-        if already_processed:
-            st.caption("この録音は直近で取り込み済みです。")
-            retry = st.button(
-                "同じ録音を再処理",
-                use_container_width=True,
-                disabled=disabled,
-                key="ceo_mic_retry_button",
-            )
-        if already_processed and not retry:
-            return
-
-        st.session_state.ceo_mic_processing = True
-        files: list[dict] = []
-        try:
-            files = [_persist_mic_recording(audio_value)]
-            if files:
-                first = files[0]
-                logger.info(
-                    "CEO 録音受領: name=%s size=%s type=%s hash=%s",
-                    first.get("file_name"),
-                    first.get("size_bytes"),
-                    getattr(audio_value, "type", ""),
-                    first.get("source_file_hash"),
-                )
-                st.info(f"録音データを受領しました（{(first.get('size_bytes') or 0) / (1024 * 1024):.1f}MB）")
-            speaker = (speaker_input or DEFAULT_CEO_SPEAKER).strip() or DEFAULT_CEO_SPEAKER
-            title_override = title_input.strip()
-            recorded_at_override = recorded_at_input.strip() or None
-
-            with st.spinner("社長音声として文字起こし中..."):
-                summary = _process_ceo_entries(
-                    files,
-                    title_override=title_override,
-                    speaker=speaker,
-                    recorded_at_override=recorded_at_override,
-                    selected_model=selected_model or DEFAULT_CEO_MODEL,
-                    logger=logger,
-                )
-
-            state["last_summary"] = summary
-            state["active_idx"] = 0
-            if current_digest:
-                st.session_state.ceo_mic_last_digest = current_digest
-            if summary.ok_count:
-                st.success("社長音声として保存しました。")
-            elif summary.skipped_count:
-                st.info("同じ録音が既に保存済みだったため、重複としてスキップしました。")
-            elif summary.error_count:
-                st.error("社長音声の取り込みに失敗しました。詳細は下の処理結果を確認してください。")
-        except Exception as exc:
-            st.error(f"社長音声の取り込みに失敗しました: {exc}")
-            logger.exception("CEO mic recording failed")
-        finally:
-            _cleanup_temp_uploads(files)
-            st.session_state.ceo_mic_processing = False
-
-
-# ---------- main tab ----------
-
-def run_ceo_tab(selected_model: str, logger) -> None:
-    st.header("社長音声")
-    st.caption("ブラウザのマイク録音を、社長音声として文字起こしします。")
-
-    state = _ensure_state()
-
-    _render_mic_recorder(selected_model or DEFAULT_CEO_MODEL, logger)
-
-    # ----- マイク録音 / 処理履歴（常時表示）-----
-    _render_queue(state.get("last_summary"))
-
-    # ----- 処理結果（常時表示）-----
-    _render_result_panel(state.get("last_summary"), state.get("active_idx", 0))
+    render_queue(_queue_items(_state(category)["results"]))
+    _render_result_panel(category)

@@ -280,7 +280,7 @@ class RAGChatLog(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String(36), nullable=True, index=True)  # セッション管理用UUID
-    chat_kind = Column(String(20), nullable=True)  # "audio"(現場録音) / "ceo"(社長音声)。NULLは旧データ=audio扱い
+    chat_kind = Column(String(20), nullable=True)  # "audio"(作業録音) / "ceo"(社長音声)。NULLは旧データ=audio扱い
     created_at = Column(DateTime, default=utcnow_naive, nullable=False)
     user_text = Column(Text, nullable=False)
     answer_text = Column(Text, nullable=True)

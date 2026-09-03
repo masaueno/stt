@@ -8,11 +8,12 @@ from typing import Dict, List, Optional, Sequence, Union
 from services.rag.context_builder import ContextDoc
 from services.rag.date_utils import jst_today
 
-_SOURCE_LABELS = {"audio": "現場録音", "ceo": "社長音声", "work": "業務記録"}
+# ui/categories.py のラベルと揃える(services層はuiに依存しないため重複定義)
+_SOURCE_LABELS = {"audio": "作業録音", "ceo": "社長音声", "work": "業務記録"}
 
 
 _CORPUS_DESCRIPTIONS = {
-    "audio": "現場の作業録音を文字起こしした「音声DB」",
+    "audio": "作業録音を文字起こしした「音声DB」",
     "ceo": "社長が録音した音声メモ・打ち合わせを文字起こしした「社長音声DB」",
     "work": "業務内容を録音した「業務記録」",
 }

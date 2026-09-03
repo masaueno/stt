@@ -14,7 +14,7 @@ Streamlitを使用した音声文字起こしWebアプリ。複数のSTTモデ�
 
 ## 機能
 
-- 複数音声ファイルの同時アップロード/マイク録音
+- マイク録音 / 複数ファイルの読み込み（作業録音・社長音声・業務記録の3カテゴリ）
 - 5つのSTTモデル対応（OpenAI、Google Cloud、Amazon、Azure、ElevenLabs）
 - Gemini Flash 2.5-liteによる文字起こしテキストの自動構造化
 - Turso(libSQL)/SQLiteデータベース保存（本番はTursoに完全移行）
@@ -54,12 +54,16 @@ nano .env
 # ブラウザで http://localhost:8501 を開く
 ```
 
-**使い方**:
+**使い方**（タブ構成: 🎙️ 録音 / 🗄️ データベース / 💬 AIチャット）:
 1. サイドバーでSTTモデルを選択（デフォルト: ElevenLabs）
-2. 音声入力:
-   - **アップロード**: ファイル選択 → 「文字起こし開始」
-   - **マイク録音**: 録音 → 「文字起こしてデータベースに保存」
-3. 「処理結果」タブで確認、「データベース」タブで過去の結果を検索
+2. 「録音」タブのサブタブ（作業録音 / 社長音声 / 業務記録）で音声入力。各画面は同じ構成:
+   - 見出し・説明 → 取り込み情報（社長音声・業務記録のみ: タイトル/話者/録音日時）
+   - 「マイク録音」（停止で自動処理） / 「ファイルを読み込む（複数可）」 → 「文字起こし開始」（作業録音）/「取り込み開始」（社長音声・業務記録）
+   - 「処理キュー」「処理結果」で確認
+3. 「データベース」タブで3カテゴリを1つの一覧で検索（カテゴリ / 期間 / タグ / 話者 / キーワード）・詳細表示・削除
+4. 「AIチャット」タブで録音データに質問（検索ソース: 作業録音 / 社長音声 / 業務記録）
+
+カテゴリ定義（キー `audio`/`ceo`/`work`、ラベル、タグ、テーブル）は `src/ui/categories.py` が正本。画面共通のUI部品は `src/ui/components.py`。
 
 ## 環境変数設定
 
@@ -136,7 +140,15 @@ WAV、MP3、M4A、FLAC、OGG
 ```
 stt/
 ├── src/
-│   ├── app.py               # メインアプリ
+│   ├── app.py               # メインアプリ（3タブ: 録音 / データベース / AIチャット）
+│   ├── ui/
+│   │   ├── categories.py    # カテゴリ定義（作業録音 / 社長音声 / 業務記録）の正本
+│   │   ├── components.py    # 画面共通UI部品（入力欄・処理キュー・処理結果・カテゴリ/期間フィルタ）
+│   │   ├── sidebar.py
+│   │   └── tabs/            # audio_tab（作業録音）/ ceo_tab（社長音声・業務記録共用）/ db_tab / rag_tab
+│   ├── services/
+│   │   ├── audio_processor.py  # 作業録音の処理（マイク/ファイル共通）
+│   │   └── ceo_processor.py    # 社長音声・業務記録の処理
 │   ├── stt_wrapper.py       # STT統一インターフェース
 │   └── text_structurer.py   # Gemini構造化
 ├── scripts/                 # 各STT実装
@@ -185,14 +197,14 @@ uv lock --upgrade
 - RAG機能は Turso(libSQL) 専用です（Postgres対応は削除）。
 - `.env` では必須の `OPENAI_API_KEY` に加え、必要に応じて `EMBEDDING_MODEL` (既定: text-embedding-3-large、dimensions=1536で格納), `EMBEDDING_DIM`, `RAG_COMPLETION_MODEL`, `ENABLE_RAG` を設定可能。
 - 新規保存分は自動でチャンク化・埋め込み登録。既存データをRAG対応させるには再保存やバックフィルスクリプトが必要。
-- Streamlit UIのQAチャットは「💬 録音データに質問」の1タブ。検索対象はソース選択pills（現場録音/社長音声/業務記録、既定は全ソース）で切り替える。
+- Streamlit UIのQAチャットは「💬 AIチャット」の1タブ。検索対象はソース選択pills（作業録音/社長音声/業務記録、既定は全ソース）で切り替える。
 - Supabase関連の機能（Storage・移行ドキュメント等）は削除済みです。
 
 ## Agent Notes（RAG開発向けメモ）
 - 本リポジトリはデータベースをTurso(libSQL)に完全移行済み。Postgres/pgvector対応はコードから削除済みです。関連依存（psycopg2, pgvector）も`pyproject.toml`から除外しました。
-- QAチャット（「録音データに質問」タブ）のアーキテクチャ:
-  - 出口は1タブ（`ui/tabs/rag_tab.py`）で、検索対象はソース選択pills（audio/ceo/work、既定は全ソース）。会話ログ`rag_chat_logs.chat_kind`はデスクトップ版と同じ規則で記録（現場録音を含む検索="audio" / 含まない="ceo"、NULLは旧データ=audio扱い。参照ソースは`contexts[].source`に残る）
-  - 新規保存分は保存時に即時索引化（現場録音: upload_tab/mic_tab、社長音声: ceo_processor）。デスクトップ版等の外部保存分はQAタブ表示時に自動取り込み（20件以下は自動、超過時はボタン表示）
+- QAチャット（「AIチャット」タブ）のアーキテクチャ:
+  - 出口は1タブ（`ui/tabs/rag_tab.py`）で、検索対象はソース選択pills（audio/ceo/work、既定は全ソース）。会話ログ`rag_chat_logs.chat_kind`はデスクトップ版と同じ規則で記録（作業録音を含む検索="audio" / 含まない="ceo"、NULLは旧データ=audio扱い。参照ソースは`contexts[].source`に残る）
+  - 新規保存分は保存時に即時索引化（作業録音: audio_processor、社長音声・業務記録: ceo_processor）。デスクトップ版等の外部保存分はQAタブ表示時に自動取り込み（20件以下は自動、超過時はボタン表示）
   - 検索モードは3種: `search`（ハイブリッド検索）/ `browse`（期間・要約だけが手がかりの質問。新しい順に最大`RAG_AGGREGATE_MAX_DOCS`=30件を薄く読む）/ `followup`（形式変更・メタ質問。再検索せず前回の参照録音を再利用）
   - `services/rag/query_cleaner.py`: 検索計画の判断材料（指示語除去・内容語判定・集約/追問判定・STT表記ゆれ同義語辞書）。同義語はprodコーパス走査で実在確認したもののみ登録（ヒケ=引け、ソリ=反り等）。指示語バイグラムはBM25を汚染するためFTSクエリから除外する（実測nDCG@6 0.47→0.64）
   - `services/rag/search_service.py`: 検索実行層。ベクトル検索（`vector_distance_cos`全走査+SQL日付フィルタ）/ キーワード検索（FTS5）/ 期間ブラウズの3操作。Phase 2（agentic search）ではこれらをLLMのツールとして公開する想定

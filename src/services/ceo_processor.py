@@ -91,8 +91,10 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def _mic_source_key(file_name: str, source_file_hash: str) -> str:
-    return f"mic:{source_file_hash}:{Path(file_name).name}"
+def _source_key(file_name: str, source_file_hash: str, input_method: str = "mic") -> str:
+    """Web経由の取り込み元を表す疑似パス(重複判定のキー)。"""
+    prefix = "mic" if input_method == "mic" else "upload"
+    return f"{prefix}:{source_file_hash}:{Path(file_name).name}"
 
 
 def _append_warning(result: CeoProcessResult, message: str) -> None:
@@ -360,11 +362,16 @@ def process_ceo_uploaded_path(
     use_vad: bool = True,
     vad_aggressiveness: int = 2,
     cleanup_source: bool = False,
+    tags: str = "社長音声",
+    input_method: str = "mic",
 ) -> CeoProcessResult:
-    """ブラウザのマイク録音一時ファイルを処理して `ceo_transcriptions` に保存する。
+    """ブラウザのマイク録音・ファイル読み込みの一時ファイルを処理して
+    `ceo_transcriptions` に保存する。
 
-    `st.audio_input` の戻り値を session_state にbytesで保持しないため、
-    UI側で一時ファイルへ退避したパスを受け取る。
+    `st.audio_input` / `st.file_uploader` の戻り値を session_state にbytesで
+    保持しないため、UI側で一時ファイルへ退避したパスを受け取る。
+    `tags` はカテゴリのタグ(社長音声 / 業務記録)、`input_method` は
+    "mic"(マイク録音) / "file_import"(ファイル読み込み)。
     """
 
     _require_configured_database()
@@ -376,16 +383,17 @@ def process_ceo_uploaded_path(
             source_file_size_bytes = None
     if source_file_hash is None:
         source_file_hash = _sha256_file(str(src))
-    source_file_path = _mic_source_key(file_name, source_file_hash)
+    source_file_path = _source_key(file_name, source_file_hash, input_method)
+    tags = (tags or "社長音声").strip() or "社長音声"
 
-    title = (title or Path(file_name).stem or "社長音声").strip()
+    title = (title or Path(file_name).stem or tags).strip()
     speaker = (speaker or DEFAULT_CEO_SPEAKER).strip() or DEFAULT_CEO_SPEAKER
     recorded_at = (recorded_at or "").strip() or None
 
     result = CeoProcessResult(
         file_name=file_name,
         status="error",
-        source_kind="mic",
+        source_kind="mic" if input_method == "mic" else "file",
         title=title,
         speaker=speaker,
         recorded_at=recorded_at,
@@ -512,7 +520,7 @@ def process_ceo_uploaded_path(
                 source_file_modified_at=source_file_modified_at,
                 source_file_hash=source_file_hash,
                 source_app="web",
-                input_method="mic",
+                input_method=input_method,
                 title=title,
                 speaker=speaker,
                 recorded_at=recorded_at,
@@ -521,7 +529,7 @@ def process_ceo_uploaded_path(
                 transcript=transcription,
                 structured_json=None,
                 duration_seconds=duration,
-                tags="社長音声",
+                tags=tags,
                 # naive UTCで統一(日付判定はUTC解釈のため。models.utcnow_naive参照)
                 created_at=utcnow_naive(),
                 word_timestamps_json=word_ts,

@@ -1,6 +1,6 @@
-"""音声DBへの質問(QAチャット)タブ。
+"""AIチャット(QA)タブ。
 
-現場録音・社長音声・業務記録の3ソースを1つのチャットで横断検索する。
+作業録音・社長音声・業務記録の3ソースを1つのチャットで横断検索する。
 検索対象はソース選択pillsで自由に絞り込める(既定は全ソース)。
 検索エンジン(RAGService)は共通で、選択ソースが検索対象とプロンプトに反映される。
 """
@@ -18,12 +18,14 @@ from models import RAGChatLog, USE_VECTOR, get_db
 from services.rag import highlight_date_in_query
 from services.rag.date_utils import jst_today
 from services.rag_service import get_rag_service
+from ui.categories import CATEGORY_LABELS
+from ui.components import render_category_pills, render_date_range
 
 logger = logging.getLogger(__name__)
 
-_SOURCE_LABELS = {"audio": "現場録音", "ceo": "社長音声", "work": "業務記録"}
+_SOURCE_LABELS = CATEGORY_LABELS
 
-_HEADER = "💬 録音データに質問"
+_HEADER = "💬 AIチャット"
 _PLACEHOLDER = "質問を入力（例: 7/28の作業内容は？ / 〇〇の件はどういう話だった？）"
 
 # 自動インデックスを黙って実行する上限(超える場合はボタンで明示実行)
@@ -253,7 +255,7 @@ def _ensure_index(rag, pending: Dict[str, int]) -> None:
     else:
         st.warning(
             f"⚠️ **{total}件の録音が検索インデックスに未登録です**"
-            f"（現場録音 {pending.get('audio', 0)}件 / 社長音声・業務記録 {pending.get('ceo', 0)}件）。"
+            f"（作業録音 {pending.get('audio', 0)}件 / 社長音声・業務記録 {pending.get('ceo', 0)}件）。"
             "デスクトップ版で保存されたデータや、検索エンジンの更新"
             "（埋め込みモデル変更）による再作成分が該当します。"
             "インデックス化するまで、これらはキーワード・類似検索の対象になりません。"
@@ -270,7 +272,7 @@ def _ensure_index(rag, pending: Dict[str, int]) -> None:
 # メイン
 # ----------------------------------------------------------------------
 def run_rag_tab():
-    """録音データへの質問タブ。現場録音・社長音声・業務記録を横断検索する。"""
+    """AIチャットタブ。作業録音・社長音声・業務記録を横断検索する。"""
     st.header(_HEADER)
 
     rag = get_rag_service()
@@ -294,16 +296,7 @@ def run_rag_tab():
     stats, pending = _corpus_snapshot()
 
     # 検索ソース選択(既定は全ソース。自由に絞り込める)
-    selected = st.pills(
-        "検索ソース",
-        options=list(_SOURCE_LABELS),
-        format_func=_SOURCE_LABELS.get,
-        selection_mode="multi",
-        default=list(_SOURCE_LABELS),
-        key="rag_sources",
-        label_visibility="collapsed",
-    )
-    sel_sources = tuple(s for s in _SOURCE_LABELS if s in (selected or ()))
+    sel_sources = render_category_pills("rag_sources", "検索ソース")
     if sel_sources:
         counts = " / ".join(
             f"{_SOURCE_LABELS[s]} **{stats.get(s, {}).get('count', 0)}件**"
@@ -320,38 +313,12 @@ def run_rag_tab():
     ctrl_cols = st.columns([1.8, 1.1, 1.1])
     manual_range: Optional[Tuple[date, date]] = None
     with ctrl_cols[0]:
-        d_from = st.session_state.get("rag_date_from")
-        d_to = st.session_state.get("rag_date_to")
-        period_label = (
-            f"📅 {d_from} 〜 {d_to}" if (d_from and d_to) else "📅 期間: 自動判定"
+        manual_range = render_date_range(
+            "rag",
+            unset_label="📅 期間: 自動判定",
+            clear_label="解除（自動に戻す）",
+            caption="通常は質問文から自動判定します（「7/28の作業」「先月の記録」等）。固定したい場合のみ指定してください。",
         )
-        with st.popover(period_label, use_container_width=True):
-            st.caption("通常は質問文から自動判定します（「7/28の作業」「先月の記録」等）。固定したい場合のみ指定してください。")
-            c1, c2 = st.columns(2)
-            with c1:
-                d_from = st.date_input(
-                    "開始日", value=d_from, key="rag_date_from_input", format="YYYY-MM-DD"
-                )
-            with c2:
-                d_to = st.date_input(
-                    "終了日", value=d_to, key="rag_date_to_input", format="YYYY-MM-DD"
-                )
-            b1, b2 = st.columns(2)
-            with b1:
-                if st.button("適用", use_container_width=True, key="rag_date_apply"):
-                    st.session_state["rag_date_from"] = d_from
-                    st.session_state["rag_date_to"] = d_to
-                    st.rerun()
-            with b2:
-                if st.button("解除（自動に戻す）", use_container_width=True, key="rag_date_clear"):
-                    st.session_state["rag_date_from"] = None
-                    st.session_state["rag_date_to"] = None
-                    st.rerun()
-        if st.session_state.get("rag_date_from") and st.session_state.get("rag_date_to"):
-            manual_range = (
-                st.session_state["rag_date_from"],
-                st.session_state["rag_date_to"],
-            )
     with ctrl_cols[1]:
         if st.button("✨ 新規会話", use_container_width=True, key="rag_new_session"):
             st.session_state["rag_session_id"] = str(uuid.uuid4())
@@ -460,7 +427,7 @@ def run_rag_tab():
             session_id=session_id,
             # タブ統合後もカラムの値域("audio"/"ceo")は変えず、デスクトップ版
             # (stt-desktop commands/rag.rs)と同じ規則で記録する:
-            # 現場録音を含む検索=audio / 含まない=ceo。
+            # 作業録音を含む検索=audio / 含まない=ceo。
             # 回答ごとの参照ソースはcontexts[].sourceに残る。
             chat_kind="audio" if "audio" in sel_sources else "ceo",
             user_text=query,
