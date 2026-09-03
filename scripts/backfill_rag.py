@@ -36,7 +36,7 @@ def main() -> None:
         if args.dry_run:
             pending = rag.pending_counts(db)
             print(
-                f"未インデックス: 現場録音 {pending.get('audio', 0)}件 / "
+                f"未インデックス: 作業録音 {pending.get('audio', 0)}件 / "
                 f"社長音声・業務記録 {pending.get('ceo', 0)}件"
             )
             return

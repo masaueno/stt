@@ -5,13 +5,11 @@ from dotenv import load_dotenv
 import logging
 
 from ui.sidebar import build_sidebar
-from ui.tabs.upload_tab import run_upload_tab
-from ui.tabs.mic_tab import run_mic_tab
-from ui.tabs.results_tab import run_results_tab
+from ui.categories import AUDIO, CEO, WORK
+from ui.tabs.audio_tab import run_audio_tab
+from ui.tabs.ceo_tab import run_ceo_tab
 from ui.tabs.db_tab import run_db_tab
 from ui.tabs.rag_tab import run_rag_tab
-from ui.tabs.ceo_tab import run_ceo_tab
-from ui.tabs.ceo_db_tab import run_ceo_db_tab
 # .envファイルを読み込む
 load_dotenv()
 
@@ -59,17 +57,7 @@ if not check_password():
 
 # タイトル
 st.title("🎙️ 音声文字起こしWebアプリ")
-st.markdown("音声ファイルをアップロードして、文字起こしと構造化を行います。")
 
-# セッション状態の初期化
-if "transcriptions" not in st.session_state:
-    st.session_state.transcriptions = []
-if "processing" not in st.session_state:
-    st.session_state.processing = False
-if "mic_processing" not in st.session_state:
-    st.session_state.mic_processing = False
-if "mic_audio_bytes" not in st.session_state:
-    st.session_state.mic_audio_bytes = None
 # AppSettings はディスク（.app_settings.json）から毎回ロードされるため、
 # session_state には常に最新の参照を入れ替えておく。
 # 初回ガード（"settings" not in st.session_state）にすると、画面再描画後に
@@ -79,28 +67,22 @@ st.session_state.settings = settings
 with st.sidebar:
     selected_model, use_structuring, debug_mode = build_sidebar(settings, log_dir, logger)
 
-tab1, tab2, tab_ceo, tab3, tab4, tab_ceo_db, tab5 = st.tabs([
-    "📤 アップロード",
-    "🎙️ マイク録音",
-    "🎤 社長音声",
-    "📊 処理結果",
+tab_record, tab_db, tab_chat = st.tabs([
+    "🎙️ 録音",
     "🗄️ データベース",
-    "📂 社長音声履歴",
-    "💬 録音データに質問",
+    "💬 AIチャット",
 ])
-with tab1:
-    run_upload_tab(selected_model, use_structuring, logger)
-with tab2:
-    run_mic_tab(selected_model, use_structuring, logger)
-with tab_ceo:
-    run_ceo_tab(selected_model, logger)
-with tab3:
-    run_results_tab()
-with tab4:
+with tab_record:
+    sub_audio, sub_ceo, sub_work = st.tabs([AUDIO.label, CEO.label, WORK.label])
+    with sub_audio:
+        run_audio_tab(selected_model, use_structuring, logger)
+    with sub_ceo:
+        run_ceo_tab(CEO, selected_model, logger)
+    with sub_work:
+        run_ceo_tab(WORK, selected_model, logger)
+with tab_db:
     run_db_tab()
-with tab_ceo_db:
-    run_ceo_db_tab()
-with tab5:
+with tab_chat:
     run_rag_tab()
 
 # フッター

@@ -114,7 +114,7 @@ class RAGService:
     # 索引作成
     # ------------------------------------------------------------------
     def index_transcription(self, db: Session, transcription_id: int, text: str) -> bool:
-        """現場録音の文字起こしをチャンク化して索引に登録する。"""
+        """作業録音の文字起こしをチャンク化して索引に登録する。"""
         return self._index_generic(db, "audio", transcription_id, text)
 
     def index_ceo_transcription(self, db: Session, transcription_id: int, text: str) -> bool:

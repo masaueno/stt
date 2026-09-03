@@ -74,3 +74,23 @@ def format_created_at_for_web(value: Any) -> str:
     if parsed is None:
         return raw
     return parsed.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def to_jst_naive(value: Any, *, naive_tz: timezone = JST) -> datetime | None:
+    """任意形式のタイムスタンプをJSTのnaive datetimeへ変換する。TZなしは naive_tz とみなす。"""
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=naive_tz)
+    return parsed.astimezone(JST).replace(tzinfo=None)
+
+
+def recorded_at_to_jst(value: Any) -> datetime | None:
+    """recorded_at(TZなしはデスクトップ版のローカル時刻=JST)をJSTへ。"""
+    return to_jst_naive(value, naive_tz=JST)
+
+
+def created_at_to_jst(value: Any) -> datetime | None:
+    """created_at(TZなしはUTC。models.utcnow_naive参照)をJSTへ。"""
+    return to_jst_naive(value, naive_tz=timezone.utc)
