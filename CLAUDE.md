@@ -204,14 +204,14 @@ uv lock --upgrade
 - 本リポジトリはデータベースをTurso(libSQL)に完全移行済み。Postgres/pgvector対応はコードから削除済みです。関連依存（psycopg2, pgvector）も`pyproject.toml`から除外しました。
 - QAチャット（「AIチャット」タブ）のアーキテクチャ:
   - 出口は1タブ（`ui/tabs/rag_tab.py`）で、検索対象はソース選択pills（audio/ceo/work、既定は全ソース）。会話ログ`rag_chat_logs.chat_kind`はデスクトップ版と同じ規則で記録（作業録音を含む検索="audio" / 含まない="ceo"、NULLは旧データ=audio扱い。参照ソースは`contexts[].source`に残る）
-  - 新規保存分は保存時に即時索引化（作業録音: audio_processor、社長音声・業務記録: ceo_processor）。デスクトップ版等の外部保存分はQAタブ表示時に自動取り込み（20件以下は自動、超過時はボタン表示）
+  - 新規保存分は保存時に即時索引化（作業録音: audio_processor、社長音声・業務記録: ceo_processor）。デスクトップ版も保存時に同じスキーマで索引化する（`stt-desktop/src-tauri/src/rag/indexer.rs`）。取りこぼし分はAIチャットタブ表示時に件数にかかわらず自動で補完（1回あたり最大300件、残りは次回）
   - 検索モードは3種: `search`（ハイブリッド検索）/ `browse`（期間・要約だけが手がかりの質問。新しい順に最大`RAG_AGGREGATE_MAX_DOCS`=30件を薄く読む）/ `followup`（形式変更・メタ質問。再検索せず前回の参照録音を再利用）
   - `services/rag/query_cleaner.py`: 検索計画の判断材料（指示語除去・内容語判定・集約/追問判定・STT表記ゆれ同義語辞書）。同義語はprodコーパス走査で実在確認したもののみ登録（ヒケ=引け、ソリ=反り等）。指示語バイグラムはBM25を汚染するためFTSクエリから除外する（実測nDCG@6 0.47→0.64）
   - `services/rag/search_service.py`: 検索実行層。ベクトル検索（`vector_distance_cos`全走査+SQL日付フィルタ）/ キーワード検索（FTS5）/ 期間ブラウズの3操作。Phase 2（agentic search）ではこれらをLLMのツールとして公開する想定
   - `services/rag/tokenizer.py`: FTS5用の文字バイグラムトークナイザ。索引テーブルは`rag_fts_audio`/`rag_fts_ceo`（Python側で行を管理、トリガ無し）。現場用語・型番の完全一致検索を辞書非依存で保証
   - `services/rag/date_utils.py`: クエリからの日付範囲抽出（「7/28」「先月」に加え「X～Y」「XからYまで」の範囲も対応）。検索は正規化済み`recorded_date`列（JST, YYYY-MM-DD）へのSQL WHEREで行う（事後フィルタ禁止）
   - `services/rag/context_builder.py`: コンテキストは録音単位（短い録音は全文、長い録音はヒット周辺の結合）。チャンク断片をそのまま渡さない。browse/集約時は`per_doc_cap`で1件を薄くして件数を優先
-  - `services/rag/reconcile.py` + `RAGService.reconcile()`: デスクトップ版保存分・社長音声の索引差分を補完。UIから自動/ボタン実行、CLIは`scripts/backfill_rag.py`
+  - `services/rag/reconcile.py` + `RAGService.reconcile()`: 索引差分（保存時に失敗した分・旧バージョン保存分）の補完。UIから自動実行、CLIは`scripts/backfill_rag.py`。チャンク分割・トークナイザ・時刻割当はデスクトップ版と同一出力（`stt-desktop/src-tauri/src/rag/testdata/web_parity_fixtures.json` はWeb版で生成した期待値）
   - 期間拡大・部分参照などの検索側の事情は`build_chat_messages(notes=…)`でモデルに明示する（モデルが期間外の録音を「日付の矛盾」と誤解しないように）
 - ハイブリッド検索の融合は重み付きRRF（Reciprocal Rank Fusion）。スコアの絶対値でのブレンドはキャリブレーション問題があるため禁止。`RAG_HYBRID_ALPHA`既定0.4（prod実データ評価でキーワード側が強いため）
 - `created_at`はWeb版（naive UTC）とデスクトップ版（RFC3339 UTC）で形式が混在。日付判定には必ず`recorded_date`を使う

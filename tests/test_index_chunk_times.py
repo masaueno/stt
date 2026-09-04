@@ -140,3 +140,56 @@ class TestIndexChunkTimes:
         assert len(chunks) == first_count
         assert len({c.chunk_index for c in chunks}) == len(chunks)
         assert all(c.time_basis == "original" for c in chunks)
+
+
+class TestReconcileMaxItems:
+    def test_max_items_limits_chunkless_rows_and_progresses(self, db, rag):
+        from services.rag.reconcile import get_index_meta, set_index_meta
+        from services.rag_service import EMBEDDING_MODEL
+
+        # 索引が現行モデルで揃っているDBに、未索引の録音が3件増えた状態
+        set_index_meta(db, "embedding_model", EMBEDDING_MODEL)
+        ids = [_insert_recording(db) for _ in range(3)]
+        db.commit()
+
+        report = rag.reconcile(db, embed=True, max_items=2)
+        assert report["indexed"]["audio"] == 2
+        assert report["errors"] == 0
+        indexed = {
+            r[0]
+            for r in db.execute(
+                sql_text("SELECT DISTINCT transcription_id FROM audio_transcription_chunks")
+            ).all()
+        }
+        assert indexed == set(ids[:2])
+        assert rag.pending_counts(db) == {"audio": 1, "ceo": 0}
+
+        # 2回目は残りだけを処理する(先頭からやり直さない)
+        report = rag.reconcile(db, embed=True, max_items=2)
+        assert report["indexed"]["audio"] == 1
+        assert rag.pending_counts(db) == {"audio": 0, "ceo": 0}
+        assert get_index_meta(db, "embedding_model") == EMBEDDING_MODEL
+
+    def test_max_items_not_applied_to_model_migration(self, db, rag):
+        from services.rag.reconcile import get_index_meta, set_index_meta
+        from services.rag_service import EMBEDDING_MODEL
+
+        # マーカーが旧モデル(=モデル変更)なら打ち切らず全件を再索引してマーカーを更新する
+        set_index_meta(db, "embedding_model", "old-model")
+        new_ids = [_insert_recording(db) for _ in range(3)]
+        db.commit()
+        total = db.execute(
+            sql_text("SELECT COUNT(*) FROM audio_transcriptions WHERE transcript != ''")
+        ).scalar()
+        report = rag.reconcile(db, embed=True, max_items=2)
+        assert report["indexed"]["audio"] == total
+        assert total >= 3
+        indexed = {
+            r[0]
+            for r in db.execute(
+                sql_text("SELECT DISTINCT transcription_id FROM audio_transcription_chunks")
+            ).all()
+        }
+        assert set(new_ids) <= indexed
+        assert rag.pending_counts(db) == {"audio": 0, "ceo": 0}
+        assert get_index_meta(db, "embedding_model") == EMBEDDING_MODEL
