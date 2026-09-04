@@ -28,8 +28,8 @@ _SOURCE_LABELS = CATEGORY_LABELS
 _HEADER = "💬 AIチャット"
 _PLACEHOLDER = "質問を入力（例: 7/28の作業内容は？ / 〇〇の件はどういう話だった？）"
 
-# 自動インデックスを黙って実行する上限(超える場合はボタンで明示実行)
-_AUTO_INDEX_LIMIT = 20
+# 一度に自動インデックス化する上限(超える分は次回開いたときに続きから処理する)
+_AUTO_INDEX_MAX_PER_VISIT = 300
 
 
 # ----------------------------------------------------------------------
@@ -210,11 +210,11 @@ def _corpus_snapshot() -> Tuple[Dict, Dict]:
 
 
 def _ensure_index(rag, pending: Dict[str, int]) -> None:
-    """索引の差分を検出し、軽い処理は自動で、重い処理は明示実行で補完する。
+    """索引の差分を検出し、開いたときに自動で補完する。
 
-    デスクトップ版などWeb以外の経路で保存されたデータもここで検索対象に取り込む。
-    _AUTO_INDEX_LIMIT件以下なら開いたときに自動実行するため、通常運用では
-    ユーザー操作なしで新しいデータが検索できるようになる。
+    Web版・デスクトップ版とも保存時に索引化するため、ここは保存時に失敗した分や
+    旧バージョンで保存された分の安全網。件数にかかわらずユーザー操作なしで実行し、
+    進捗を表示する(デスクトップ版のAIチャットも同じ動作)。
     """
     if "rag_light_reconciled" not in st.session_state:
         db = next(get_db())
@@ -237,7 +237,9 @@ def _ensure_index(rag, pending: Dict[str, int]) -> None:
                 bar = st.progress(0.0)
                 def cb(done, all_count, label):
                     bar.progress(min(1.0, done / max(1, all_count)), text=f"{done}/{all_count} 件 ({label})")
-                report = rag.reconcile(db2, embed=True, progress_cb=cb)
+                report = rag.reconcile(
+                    db2, embed=True, progress_cb=cb, max_items=_AUTO_INDEX_MAX_PER_VISIT
+                )
                 ok = sum(report.get("indexed", {}).values())
                 errs = report.get("errors", 0)
                 status.update(
@@ -250,22 +252,12 @@ def _ensure_index(rag, pending: Dict[str, int]) -> None:
         _corpus_snapshot.clear()
         st.rerun()
 
-    if total <= _AUTO_INDEX_LIMIT:
-        _run_indexing()
-    else:
-        st.warning(
-            f"⚠️ **{total}件の録音が検索インデックスに未登録です**"
-            f"（作業録音 {pending.get('audio', 0)}件 / 社長音声・業務記録 {pending.get('ceo', 0)}件）。"
-            "デスクトップ版で保存されたデータや、検索エンジンの更新"
-            "（埋め込みモデル変更）による再作成分が該当します。"
-            "インデックス化するまで、これらはキーワード・類似検索の対象になりません。"
+    if total > _AUTO_INDEX_MAX_PER_VISIT:
+        st.info(
+            f"未登録の録音が {total}件あります。まず {_AUTO_INDEX_MAX_PER_VISIT}件を"
+            "インデックス化し、残りは次回開いたときに続けます。"
         )
-        if st.button(
-            f"今すぐインデックス化する（約{max(1, total // 100)}〜{max(2, total // 50)}分）",
-            type="primary",
-            key="rag_reindex_btn",
-        ):
-            _run_indexing()
+    _run_indexing()
 
 
 # ----------------------------------------------------------------------

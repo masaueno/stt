@@ -46,6 +46,7 @@ from services.rag.reconcile import (
     cleanup_orphan_chunks,
     fill_recorded_dates,
     find_unindexed,
+    get_index_meta,
     normalize_to_jst_date,
     set_index_meta,
     sync_fts,
@@ -223,8 +224,14 @@ class RAGService:
         db: Session,
         embed: bool = True,
         progress_cb: Optional[Callable[[int, int, str], None]] = None,
+        max_items: Optional[int] = None,
     ) -> Dict:
-        """索引の差分を補完する。embed=Falseなら埋め込み不要の処理のみ。"""
+        """索引の差分を補完する。embed=Falseなら埋め込み不要の処理のみ。
+
+        max_itemsを渡すと、チャンク未作成分の埋め込み生成をその件数で打ち切る(残りは次回)。
+        埋め込みモデル変更による全件再作成には適用しない(打ち切ると次回また先頭から
+        やり直しになり進まないため。モデル変更時は scripts/backfill_rag.py で一括実行する)。
+        """
         report: Dict = {}
         report["dates_filled"] = fill_recorded_dates(db)
         report["orphan_chunks_removed"] = cleanup_orphan_chunks(db)
@@ -238,6 +245,12 @@ class RAGService:
         if not embed or not self.enabled:
             return report
 
+        model_changed = get_index_meta(db, "embedding_model") != EMBEDDING_MODEL
+        if max_items is not None and not model_changed:
+            budget = max(0, max_items)
+            for source in list(missing.keys()):
+                missing[source] = missing[source][:budget]
+                budget -= len(missing[source])
         total = sum(len(ids) for ids in missing.values())
         done = 0
         for source, ids in missing.items():
